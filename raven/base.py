@@ -37,7 +37,8 @@ from raven.utils import json, get_versions, get_auth_header, merge_dicts
 from raven._compat import text_type, iteritems
 from raven.utils.encoding import to_unicode
 from raven.utils.serializer import transform
-from raven.utils.stacks import get_stack_info, iter_stack_frames, get_culprit
+from raven.utils.stacks import get_stack_info, iter_stack_frames, slim_string
+from raven.utils.transaction import TransactionStack
 from raven.transport.registry import TransportRegistry, default_transports
 
 # enforce imports to avoid obscure stacktraces with MemoryError
@@ -186,6 +187,10 @@ class Client(object):
         self.tags = o.get('tags') or {}
         self.environment = o.get('environment') or None
         self.release = o.get('release') or os.environ.get('HEROKU_SLUG_COMMIT')
+        self.transaction = TransactionStack()
+        # find the root transaction as the command which launched this
+        # process
+        self.transaction.push(slim_string(' '.join(sys.argv), 128))
 
         self.ignore_exceptions = set(o.get('ignore_exceptions') or ())
 
@@ -410,12 +415,7 @@ class Client(object):
                     )
 
         if not culprit:
-            if 'stacktrace' in data:
-                culprit = get_culprit(data['stacktrace']['frames'])
-            elif 'exception' in data:
-                stacktrace = data['exception']['values'][0].get('stacktrace')
-                if stacktrace:
-                    culprit = get_culprit(stacktrace['frames'])
+            culprit = self.transaction.peek()
 
         if not data.get('level'):
             data['level'] = kwargs.get('level') or logging.ERROR
@@ -599,6 +599,11 @@ class Client(object):
         if exc_info is not None:
             if self.skip_error_for_logging(exc_info):
                 return
+            elif not self.should_capture(exc_info):
+                self.logger.info(
+                    'Not capturing exception due to filters: %s', exc_info[0],
+                    exc_info=sys.exc_info())
+                return
             self.record_exception_seen(exc_info)
 
         data = self.build_msg(
@@ -774,12 +779,6 @@ class Client(object):
         """
         if exc_info is None or exc_info is True:
             exc_info = sys.exc_info()
-
-        if not self.should_capture(exc_info):
-            self.logger.info(
-                'Not capturing exception due to filters: %s', exc_info[0],
-                exc_info=sys.exc_info())
-            return
 
         return self.capture(
             'raven.events.Exception', exc_info=exc_info, **kwargs)
